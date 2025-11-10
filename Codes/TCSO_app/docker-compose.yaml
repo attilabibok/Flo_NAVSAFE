@@ -1,0 +1,102 @@
+version: "3.8"
+
+services:
+  tcso-pgis:
+    image: postgis/postgis:17-3.5
+    container_name: tcso-pgis
+    environment:
+      POSTGRES_DB: gis
+      POSTGRES_USER: gis
+      POSTGRES_PASSWORD: gis
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  tcso-geoserver:
+    image: kartoza/geoserver:2.27.2
+    container_name: tcso-geoserver
+    depends_on:
+      - tcso-pgis
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: geoserver
+      TZ: UTC
+    ports:
+      - "8080:8080"
+    volumes:
+      - gsdata:/opt/geoserver/data_dir
+
+  tcso-geoserver-init:
+    build:
+      context: ./worker
+    container_name: tcso-geoserver-init
+    depends_on:
+      - tcso-geoserver
+      - tcso-pgis
+    environment:
+      GEOSERVER_URL: http://tcso-geoserver:8080/geoserver
+      GEOSERVER_USER: admin
+      GEOSERVER_PASSWORD: geoserver
+      GEOSERVER_WORKSPACE: tcso
+      GEOSERVER_DATASTORE: tcso_postgis
+
+      PG_HOST: tcso-pgis
+      PG_PORT: 5432
+      PG_DB: gis
+      PG_USER: gis
+      PG_PASS: gis
+
+      # reuse OUT_* schema/table config from fim.py if you want via env
+      OUT_PG_SCHEMA: public
+      OUT_PG_FLOWLINES_TABLE: nwm_sr_flowlines
+      OUT_PG_FIM_TABLE: fim_nwm
+    command: ["python", "geoserver_init.py"]
+    restart: "on-failure"
+
+  tcso-worker:
+    build:
+      context: ./worker
+    container_name: tcso-worker
+    depends_on:
+      - tcso-pgis
+      - tcso-geoserver
+    environment:
+      # NWM / FIM / OUT config (example values; tune as needed)
+      NWM_BUCKET: noaa-nwm-pds
+      NWM_PRODUCT: short_range
+      NWM_VARIABLE: streamflow
+      NWM_LOOKBACK_DAYS: 4
+
+      FIM_GPKG: /data/Theme4Data.gpkg
+      FIM_FLOWLINES_GPKG: /data/p2fflowlines_tcso.gpkg
+      FIM_FIM_LAYER: TravisFIM
+      FIM_RATING_TABLE: RatingCurves
+      FIM_LAKE_FIELD: LakeID
+      FIM_LAKE_MISSING: -999
+
+      OUT_MODE: postgis
+      OUT_PG_DSN: postgresql://gis:gis@tcso-pgis:5432/gis
+      OUT_PG_SCHEMA: public
+      OUT_PG_FLOWLINES_TABLE: nwm_sr_flowlines
+      OUT_PG_FIM_TABLE: fim_nwm
+
+      # file export base; worker writes here (and S3 if configured in fim.py)
+      OUT_GPKG_PATH: /data/output/nwm_fim.gpkg
+      OUT_FIM_FORMATS: "gpkg,geojson"
+
+      # optional S3 export (used by fim.py write_fim)
+      # OUT_FIM_S3_BUCKET: my-fim-bucket
+      # OUT_FIM_S3_PREFIX: tcso/fim
+      # OUT_FIM_S3_LIVE_KEY: FIM_TCSO_live.geojson
+
+      TZ: America/New_York
+    volumes:
+      - ./worker:/app
+      - ./data:/data
+    command: ["uvicorn", "nwm_fim_worker:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  gsdata:
