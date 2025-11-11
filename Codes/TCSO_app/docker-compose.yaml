@@ -11,7 +11,25 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./_postgres_data:/var/lib/postgresql/data
+
+  tcso-init-postgis:
+    build:
+      context:  ./init_db
+      dockerfile: Dockerfile
+    container_name: tcso-init-postgis
+    depends_on:
+      - tcso-pgis
+        # condition: service_healthy
+    environment:
+      PGHOST: tcso-pgis
+      PGPORT: 5432
+      PGDATABASE: gis
+      PGUSER: gis
+      PGPASSWORD: gis
+      PGSCHEMA: public
+      LOG_LEVEL: INFO
+    restart: "no"  # run once; idempotent anyway
 
   tcso-geoserver:
     image: kartoza/geoserver:2.27.2
@@ -21,11 +39,12 @@ services:
     environment:
       GEOSERVER_ADMIN_USER: admin
       GEOSERVER_ADMIN_PASSWORD: geoserver
+      # TZ: America/New_York
       TZ: UTC
     ports:
       - "8080:8080"
     volumes:
-      - gsdata:/opt/geoserver/data_dir
+      - ./_geoserver_data:/opt/geoserver/data_dir
 
   tcso-geoserver-init:
     build:
@@ -39,7 +58,7 @@ services:
       GEOSERVER_USER: admin
       GEOSERVER_PASSWORD: geoserver
       GEOSERVER_WORKSPACE: tcso
-      GEOSERVER_DATASTORE: tcso_postgis
+      GEOSERVER_DATASTORE: tcso-pgis
 
       PG_HOST: tcso-pgis
       PG_PORT: 5432
@@ -90,13 +109,42 @@ services:
       # OUT_FIM_S3_PREFIX: tcso/fim
       # OUT_FIM_S3_LIVE_KEY: FIM_TCSO_live.geojson
 
-      TZ: America/New_York
+      # TZ: America/New_York
+      TZ: UTC
     volumes:
       - ./worker:/app
       - ./data:/data
-    command: ["uvicorn", "nwm_fim_worker:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "nwm_fim_worker:app", "--host", "0.0.0.0", "--port", "8200"]
+    ports:
+      - "8200:8200"
     restart: unless-stopped
 
-volumes:
-  pgdata:
-  gsdata:
+    # This service purges outdated data except when exceptions are recorded
+  tcso-maintainer:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: tcso-maintainer
+    restart: unless-stopped
+    depends_on:
+      - tcso-pgis
+    environment:
+      # Point to same PostGIS & FIM table as the worker
+      MAINTAINER_PG_DSN: postgresql://gis:gis@tcso-pgis:5432/gis
+      MAINTAINER_PG_SCHEMA: public
+      MAINTAINER_FIM_TABLE: fim_nwm
+
+      # Keep 3 days of history (adjust as needed, ISO 8601 duration)
+      MAINTAINER_RETENTION: P3D
+
+      # Cleanup loop
+      MAINTAINER_INTERVAL_SEC: 900
+      MAINTAINER_ENABLED: "true"
+
+      # Logging
+      MAINTAINER_LOG_LEVEL: INFO
+    volumes:
+      - ./worker:/app
+    command: ["uvicorn", "nwm_fim_maintainer:app", "--host", "0.0.0.0", "--port", "8100"]
+    ports:
+      - "8100:8100"
