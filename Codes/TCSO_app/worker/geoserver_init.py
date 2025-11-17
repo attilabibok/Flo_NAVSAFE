@@ -102,6 +102,14 @@ class Settings:
     flowlines_table: str = os.getenv("FLOWLINES_TABLE", "nwm_sr_flowlines")
     fim_table: str = os.getenv("FIM_TABLE", "fim_nwm")
 
+    # point-status base tables (written by the pipeline)
+    addresspoints_table: str = os.getenv("ADDRESSPOINTS_TABLE", "addresspoints")
+    lowwater_table: str = os.getenv("LOWWATERCROSSINGS_TABLE", "lowwatercrossings")
+
+    # materialized view names (published as layers)
+    addresspoints_nowcast_view: str = os.getenv("ADDRESSPOINTS_NOWCAST_VIEW", "addresspoints_nowcast")
+    lowwater_nowcast_view: str = os.getenv("LOWWATER_NOWCAST_VIEW", "lowwatercrossings_nowcast")
+
     @property
     def gs_auth(self) -> tuple[str, str]:
         return self.gs_user, self.gs_password
@@ -725,6 +733,31 @@ FROM ranked
 WHERE rn = 1
 ORDER BY id;
 """
+def _mv_nowcast_sql_for_points(table_name: str) -> str:
+    """
+    Build SQL body for a points 'nowcast' materialized view:
+      - Latest t0 across the base table
+      - For that t0, earliest valid_time
+      - DISTINCT ON (id) to guarantee row-uniqueness by id
+      - Selects * to keep all original attributes (OBJECTID, Situation, etc.)
+    """
+    schema = SETTINGS.pg_schema
+    base = f'"{schema}"."{table_name}"'
+    return f"""
+WITH latest AS (
+  SELECT MAX(t0) AS max_t0 FROM {base}
+),
+earliest AS (
+  SELECT MIN(valid_time) AS min_valid_time
+  FROM {base}, latest
+  WHERE t0 = latest.max_t0
+)
+SELECT DISTINCT ON (id) *
+FROM {base}, latest, earliest
+WHERE t0 = latest.max_t0
+  AND valid_time = earliest.min_valid_time
+ORDER BY id;
+"""
 
 
 
@@ -748,20 +781,35 @@ def main() -> None:
     ensure_featuretype(SETTINGS.flowlines_table)
     ensure_featuretype(SETTINGS.fim_table)
 
-    # 3) Materialized views for nowcast and max
+    # 3) FIM Materialized views for nowcast and max
     nowcast_sql = build_nowcast_sql()
     max_sql = build_max_sql()
 
     ensure_materialized_view("fim_nowcast", nowcast_sql, pk_column="id")
     ensure_materialized_view("fim_max", max_sql, pk_column="id")
 
-    # 4) Publish materialized views as layers
+
+    # 4) AddressPoints & LowWaterCrossings nowcast MVs
+    ap_mv = SETTINGS.addresspoints_nowcast_view
+    lwc_mv = SETTINGS.lowwater_nowcast_view
+
+    ap_sql = _mv_nowcast_sql_for_points(SETTINGS.addresspoints_table)
+    lwc_sql = _mv_nowcast_sql_for_points(SETTINGS.lowwater_table)
+
+    ensure_materialized_view(ap_mv, ap_sql, pk_column="id")
+    ensure_materialized_view(lwc_mv, lwc_sql, pk_column="id")
+
+    # 5) Publish MVs and set PK
     ensure_featuretype("fim_nowcast")
     ensure_featuretype("fim_max")
-
-    # Optional but harmless: explicitly mark 'id' as PK for these layers
     ensure_featuretype_pk("fim_nowcast", "id")
     ensure_featuretype_pk("fim_max", "id")
+
+    ensure_featuretype(ap_mv)
+    ensure_featuretype(lwc_mv)
+    ensure_featuretype_pk(ap_mv, "id")
+    ensure_featuretype_pk(lwc_mv, "id")
+
 
     logger.info("GeoServer/PostGIS initialization completed successfully.")
 

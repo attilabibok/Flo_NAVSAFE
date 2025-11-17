@@ -53,6 +53,7 @@ from fim import (
     write_flowlines,
     generate_all_fim_layers,
     refresh_fim_materialized_views, 
+    write_point_status_layers
 )
 
 # -----------------------------------------------------------------------------
@@ -224,7 +225,7 @@ async def poll_latest_forecast(interval_seconds: int = WORKER_INTERVAL_SEC) -> N
 
             # 5) Generate all FIM layers for this t0
             try:
-                generate_all_fim_layers(
+                fim_polys_gdf = generate_all_fim_layers(
                     df_forecast=df,
                     settings=settings,
                     flowlines=flowlines,
@@ -237,8 +238,24 @@ async def poll_latest_forecast(interval_seconds: int = WORKER_INTERVAL_SEC) -> N
                 )
                 await asyncio.sleep(interval_seconds)
                 continue
+            # 5b) Generate Point layers for low water crossings and addresspoints 
 
-            # 5b) Refresh FIM-related materialized views so GeoServer sees consistent data.
+            try:
+                write_point_status_layers(
+                    fim_polys_5070=fim_polys_gdf,   # the polygons you just generated/published (EPSG:5070)
+                    settings=settings,
+                    t0_utc=latest_t0_utc,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Error generating Point(AP,LWC) layers for t0=%s: %s",
+                    latest_t0_utc.isoformat(),
+                    exc,
+                )
+                await asyncio.sleep(interval_seconds)
+                continue
+
+            # 5c) Refresh FIM-related materialized views so GeoServer sees consistent data.
             try:
                 refresh_fim_materialized_views(settings)
             except Exception as exc:
@@ -248,6 +265,7 @@ async def poll_latest_forecast(interval_seconds: int = WORKER_INTERVAL_SEC) -> N
                     latest_t0_utc.isoformat(),
                     exc,
                 )
+            
 
             # 6) Mark success
             _last_processed_t0 = latest_t0_utc

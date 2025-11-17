@@ -4,7 +4,7 @@ services:
   tcso-pgis:
     image: postgis/postgis:17-3.5
     container_name: tcso-pgis
-    environment:
+    environment: 
       POSTGRES_DB: gis
       POSTGRES_USER: gis
       POSTGRES_PASSWORD: gis
@@ -103,6 +103,10 @@ services:
       # file export base; worker writes here (and S3 if configured in fim.py)
       OUT_GPKG_PATH: /data/output/nwm_fim.gpkg
       OUT_FIM_FORMATS: "gpkg,geojson"
+
+      #points
+      ADDRESS_GPKG: /data/addresspoints.gpkg
+      LWC_GPKG: /data/lowwatercrossingsall.gpkg
 
       # optional S3 export (used by fim.py write_fim)
       # OUT_FIM_S3_BUCKET: my-fim-bucket

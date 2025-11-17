@@ -122,13 +122,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Iterable
 from shapely.geometry import Polygon, MultiPolygon
-
+from shapely import set_precision
+from typing import Literal
+from sqlalchemy import create_engine, text
+from sqlalchemy.types import String
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import s3fs
 import xarray as xr
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 try:
@@ -198,18 +202,19 @@ class OutputSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OUT_", extra="ignore")
 
     # Mode selection
-    MODE: str = "both"  # "gpkg", "postgis", or "both"
+    MODE: str = "both"  # "gpkg", "postgis", or "both", "s3"
 
     # File outputs (base)
     GPKG_PATH: str = "./output/nwm_fim.gpkg"
     FLOWLINES_LAYER: str = "nwm_sr_flowlines"
     FIM_LAYER_PREFIX: str = "fim_"  # kept for backwards compatibility
+    LOCAL_OUT_DIR: str = "./output"
 
     # Which formats to emit for each FIM snapshot ("gpkg", "geojson", or both)
     FIM_FORMATS: str = "gpkg,geojson"
 
     # PostGIS outputs
-    PG_DSN: Optional[str] = None
+    PG_DSN: Optional[str] = "postgresql://gis:gis@localhost:5432/gis"
     PG_SCHEMA: str = "public"
     PG_FLOWLINES_TABLE: str = "nwm_sr_flowlines"
     PG_FIM_TABLE: str = "fim_nwm"
@@ -221,6 +226,25 @@ class OutputSettings(BaseSettings):
     # Optional S3 key for a "live" GeoJSON pointing to latest snapshot
     FIM_S3_LIVE_KEY: Optional[str] = None
 
+    # Generic S3 output settings
+    S3_BUCKET: str | None = None
+    S3_PREFIX: str | None = None
+
+
+class PointsInputSettings(BaseSettings):
+    model_config = SettingsConfigDict(extra="ignore")
+    # GeoPackage paths + layer names
+    address_gpkg: str | None = Field("./Codes/TCSO_app/data/addresspoints.gpkg", description="Path to address_points.gpkg")
+    address_layer: str = Field("addresspoints", description="Layer name inside the GPKG")
+    lwc_gpkg: str | None = Field("./Codes/TCSO_app/data/lowwatercrossingsall.gpkg", description="Path to lowwatercrossings.gpkg")
+    lwc_layer: str = Field("lowwatercrossingsall", description="Layer name inside the GPKG")
+
+    # Column in the point layers to serve as a stable per-point identifier.
+    # If empty/missing, we fall back to the GeoDataFrame index.
+    point_id_column: str | None = Field(default=None, description="Unique ID column in point layers")
+
+    # CRS to enforce for points (should match FIM)
+    target_epsg: int = Field(5070, description="Target EPSG for points/FIM operations")
 
 @dataclass
 class PipelineSettings:
@@ -228,6 +252,7 @@ class PipelineSettings:
 
     nwm: NWMSettings
     fim: FIMSettings
+    points: PointsInputSettings
     out: OutputSettings
 
     @classmethod
@@ -240,7 +265,7 @@ class PipelineSettings:
         PipelineSettings
             Fully-populated settings object.
         """
-        return cls(nwm=NWMSettings(), fim=FIMSettings(), out=OutputSettings())
+        return cls(nwm=NWMSettings(), fim=FIMSettings(), points=PointsInputSettings(), out=OutputSettings())
 
 
 # -----------------------------------------------------------------------------
@@ -943,8 +968,604 @@ def _find_latest_cycle(
 
 
 # -----------------------------------------------------------------------------
+# Helpers for LWC and AP checks
+# -----------------------------------------------------------------------------
+def _as_utc(ts) -> pd.Timestamp:
+    """Return a pandas Timestamp in UTC regardless of input being naive/aware."""
+    t = pd.Timestamp(ts)
+    if t.tz is None:
+        return t.tz_localize("UTC")
+    return t.tz_convert("UTC")
+
+def _ensure_epsg_5070(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Guarantee geometry is in EPSG:5070."""
+    if gdf.empty:
+        return gdf
+    if gdf.crs is None:
+        # assume already 5070 if not provided; override explicitly
+        return gdf.set_crs(5070, allow_override=True)
+    return gdf if gdf.crs.to_epsg() == 5070 else gdf.to_crs(5070)
+
+def _fmt_z(dt: pd.Timestamp | datetime) -> str:
+    """Return UTC timestamp in YYYYMMDDHHMMZ format."""
+    if isinstance(dt, pd.Timestamp):
+        if dt.tzinfo is None:
+            dt = dt.tz_localize("UTC")
+        else:
+            dt = dt.tz_convert("UTC")
+        py = dt.to_pydatetime()
+    else:
+        py = dt
+        if py.tzinfo is None:
+            py = py.replace(tzinfo=timezone.utc)
+        else:
+            py = py.astimezone(timezone.utc)
+    return py.strftime("%Y%m%d%H%MZ")
+
+def _apply_point_ids(gdf_status: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Create 'id' = <OBJECTID>_<t0UTC>_<valid_timeUTC>.
+    Assumes t0/valid_time are present (from FIM join); if NaN (Safe), uses
+    UTC zero time for the stamp so the id remains deterministic per OBJECTID+t0 window.
+    Then de-duplicate on 'id'.
+    """
+    # Fill missing times deterministically (00Z) for Safe points
+    t0_filled = pd.to_datetime(gdf_status.get("t0")).dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT").fillna(pd.Timestamp("1970-01-01T00:00:00Z"))
+    vt_filled = pd.to_datetime(gdf_status.get("valid_time")).dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT").fillna(pd.Timestamp("1970-01-01T00:00:00Z"))
+
+    # OBJECTID can be int or str; coerce to str
+    obj = gdf_status["OBJECTID"].astype(str)
+
+    gdf_status = gdf_status.copy()
+    gdf_status["id"] = [
+        f"{o}_{_fmt_z(t0)}_{_fmt_z(vt)}"
+        for o, t0, vt in zip(obj, t0_filled, vt_filled, strict=False)
+    ]
+
+    # Keep first if duplicates
+    gdf_status = gdf_status.drop_duplicates(subset=["id"], keep="first")
+    return gdf_status
+
+
+def _write_points_table_postgis(
+    gdf: gpd.GeoDataFrame,
+    *,
+    table: str,
+    schema: str,
+    dsn: str,
+    t0_utc: datetime,
+) -> None:
+    """
+    Write gdf to PostGIS keeping all original columns, plus:
+      - id (PRIMARY KEY)
+      - Situation (text)
+    Idempotent per t0: deletes any rows with the same t0 before append.
+    Also builds indexes on (t0), (valid_time), and (OBJECTID).
+    """
+    if gdf.empty:
+        return
+
+    gdf = _ensure_epsg_5070(gdf)
+
+    engine = create_engine(dsn)
+    with engine.begin() as conn:
+        # If table exists, wipe same t0 to keep idempotent
+        exists = conn.execute(text("""
+            SELECT EXISTS (
+              SELECT 1 FROM information_schema.tables
+              WHERE table_schema = :schema AND table_name = :table
+            )
+        """), {"schema": schema, "table": table}).scalar()
+
+        if exists:
+            conn.execute(text(f'DELETE FROM "{schema}"."{table}" WHERE t0 = :t0')), {"t0": t0_utc}
+        # Append (creates table if not exists, including all original columns + id + Situation)
+        gdf.to_postgis(name=table, con=conn.connection, schema=schema, if_exists="append", index=False)
+
+        # Ensure PK + helpful indexes (safe / if-not-exists)
+        # 1) Add PK if not present
+        has_pk = conn.execute(text("""
+            SELECT COUNT(*) FROM information_schema.table_constraints
+            WHERE table_schema=:schema AND table_name=:table AND constraint_type='PRIMARY KEY'
+        """), {"schema": schema, "table": table}).scalar()
+        if not has_pk:
+            # Need unique index first (faster & avoids lock if dup)
+            conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{table}_id_key" ON "{schema}"."{table}" (id)'))
+            conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD CONSTRAINT "{table}_pkey" PRIMARY KEY (id)'))
+
+        conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_t0_idx" ON "{schema}"."{table}" (t0)'))
+        if "valid_time" in gdf.columns:
+            conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_valid_time_idx" ON "{schema}"."{table}" (valid_time)'))
+        if "OBJECTID" in gdf.columns:
+            conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_objectid_idx" ON "{schema}"."{table}" ("OBJECTID")'))
+
+
+def _load_points_layer(path: str, layer: str, target_epsg: int) -> gpd.GeoDataFrame:
+    """
+    Read a GeoPackage point layer and reproject to target_epsg if needed.
+    Ensures geometry type is POINT and drops empties.
+    """
+    gdf = gpd.read_file(path, layer=layer)
+    if gdf.empty:
+        return gdf
+
+    if gdf.crs is None:
+        raise ValueError(f"Points layer '{layer}' has no CRS defined: {path}")
+
+    if gdf.crs.to_epsg() != target_epsg:
+        gdf = gdf.to_crs(target_epsg)
+
+    # keep only valid points
+    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notnull()]
+    if not all(gdf.geometry.geom_type.isin(["Point"])):
+        # silently cast centroids if some are multipoints? — Prefer strict fail:
+        raise ValueError(f"Layer '{layer}' must be POINT geometries.")
+
+    return gdf
+
+
+# --- Spatial join: points within FIM polygons --------------------------------
+
+def _status_from_points(
+    points_gpkg: Path,
+    layer: str,
+    fim_polys_5070: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    
+    """
+    Load point features, ensure EPSG:5070, and flag each as 'Flooded' if it falls
+    within any FIM polygon; otherwise 'Safe'.
+
+    Keeps all original point attributes and adds:
+      - Situation: 'Flooded'|'Safe'
+      - match_fim_id: polygon id if available; if not, a derived id
+        "<HydroID>_<t0UTC>_<validUTC>" when HydroID/t0/valid_time exist, else NaN
+      - HydroID, HIndex, HValue, t0, valid_time from the matched polygon (NaN if none)
+    """
+    pts = gpd.read_file(points_gpkg, layer=layer)
+    pts = _ensure_epsg_5070(pts)
+
+    # If no polygons, mark everything Safe and add empty columns.
+    if fim_polys_5070.empty:
+        pts = pts.copy()
+        pts["Situation"] = "Safe"
+        for c in ["match_fim_id", "HydroID", "HIndex", "HValue", "t0", "valid_time"]:
+            if c not in pts.columns:
+                pts[c] = pd.NA
+        return pts
+
+    # Build the polygon view with whatever ID info is available.
+    poly_cols = ["HydroID", "HIndex", "HValue", "t0", "valid_time", "geometry"]
+    has_id = "id" in fim_polys_5070.columns
+    if has_id:
+        poly_cols = ["id"] + poly_cols
+
+    fim_view = fim_polys_5070[poly_cols].copy()
+
+    # Spatial join: points within polygons
+    j = gpd.sjoin(pts, fim_view, how="left", predicate="within")
+
+    # Normalize output fields
+    if has_id:
+        # rename joined 'id' (from polygon) to 'match_fim_id'
+        if "id" in j.columns:
+            j = j.rename(columns={"id": "match_fim_id"})
+    else:
+        # derive a match_fim_id from HydroID+t0+valid_time when available
+        def _derive_id(r):
+            try:
+                if pd.notna(r.get("HydroID")) and pd.notna(r.get("t0")) and pd.notna(r.get("valid_time")):
+                    t0z = pd.to_datetime(r["t0"], utc=True).strftime("%Y%m%d%H%MZ")
+                    vtz = pd.to_datetime(r["valid_time"], utc=True).strftime("%Y%m%d%H%MZ")
+                    return f"{int(r['HydroID'])}_{t0z}_{vtz}"
+            except Exception:
+                pass
+            return pd.NA
+
+        j["match_fim_id"] = j.apply(_derive_id, axis=1)
+
+    # Situation flag: Flooded if polygon matched; else Safe
+    j["Situation"] = j["match_fim_id"].notna().map({True: "Flooded", False: "Safe"})
+
+    # Clean up the spatial join helper column
+    if "index_right" in j.columns:
+        j = j.drop(columns=["index_right"])
+
+    return j
+
+def _points_status_against_fim(
+    points_5070: gpd.GeoDataFrame,
+    fim_polys_5070: gpd.GeoDataFrame,
+    *,
+    source_name: Literal["address", "lwc"],
+    point_id_column: str | None,
+    t0_utc: datetime,
+) -> gpd.GeoDataFrame:
+    """
+    Label *all* input points against FIM polygons with Situation='Flooded' or 'Safe'.
+
+    Rules
+    -----
+    - Flooded: point is spatially within (or on boundary of) a FIM polygon.
+    - Safe   : otherwise.
+
+    Behavior
+    --------
+    - Keeps every input point (even if Safe).
+    - If a point intersects multiple polygons, keep the row with the highest HIndex
+      (tie-break: lowest valid_time, then lexical id, deterministic).
+    - Builds a stable id:
+        id = "<source>_<pointKey>_<t0UTC>%Y%m%d%H%MZ>_<match_fim_id|SAFE>"
+    - Preserves original point attributes; appends: Situation, match_fim_id, HydroID, HIndex, HValue, t0, valid_time.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame (EPSG:5070)
+    """
+    # Enforce 5070
+    if points_5070.crs is None or points_5070.crs.to_epsg() != 5070:
+        points_5070 = points_5070.to_crs(5070)
+    if fim_polys_5070.crs is None or fim_polys_5070.crs.to_epsg() != 5070:
+        fim_polys_5070 = fim_polys_5070.to_crs(5070)
+
+    pts = points_5070.copy()
+    pts = pts[~pts.geometry.is_empty & pts.geometry.notnull()]
+
+    # Spatial join; switch to predicate="covered_by" if boundary should count as Flooded
+    hits = gpd.sjoin(
+        pts,
+        fim_polys_5070[["id", "HydroID", "HIndex", "HValue", "t0", "valid_time", "geometry"]],
+        predicate="within",
+        how="left",
+    ).drop(columns=["index_right"])
+
+    # If a point matched multiple polygons, choose the "best" by HIndex desc, valid_time asc, id asc
+    if hits.index.has_duplicates:
+        hits = (
+            hits.assign(
+                __rn=hits.groupby(level=0)
+                .apply(lambda df: df.sort_values(
+                    by=["HIndex", "valid_time", "id"],
+                    ascending=[False, True, True]
+                ))
+                .reset_index(level=0, drop=True)
+                .groupby(level=0)
+                .cumcount()
+            )
+        )
+        hits = hits[hits["__rn"] == 0].drop(columns="__rn")
+
+    flooded_mask = hits["id"].notna()
+
+    # Situation
+    hits.insert(0, "Situation", flooded_mask.map({True: "Flooded", False: "Safe"}))
+
+    # Build stable ID
+    if point_id_column and point_id_column in pts.columns:
+        pt_key = hits[point_id_column].astype(str)
+    else:
+        pt_key = hits.index.astype(str)
+
+    tstamp = t0_utc.strftime("%Y%m%d%H%MZ")
+    match_fim_id = hits["id"].fillna("SAFE").astype(str)
+    new_id = f"{source_name}_" + pt_key + f"_{tstamp}_" + match_fim_id
+    hits.insert(0, "id", new_id)
+
+    # Rename FIM id to avoid clashing with our new 'id'
+    hits = hits.rename(columns={"id": "match_fim_id"})
+
+    # Order cols: all original point cols (except geometry), then status + FIM attrs + geometry
+    keep_point_cols = [c for c in pts.columns if c != "geometry"]
+    ordered = (
+        ["id", "Situation"]
+        + keep_point_cols
+        + ["match_fim_id", "HydroID", "HIndex", "HValue", "t0", "valid_time", "geometry"]
+    )
+    hits = hits.reindex(columns=ordered)
+
+    # Tiny precision guard
+    try:
+        hits["geometry"] = set_precision(hits.geometry.values, grid_size=0.001)
+    except Exception:
+        pass
+
+    hits = hits.set_crs(5070)
+    return hits
+
+def write_point_status_layers(
+    *,
+    fim_polys_5070: gpd.GeoDataFrame,
+    settings: "PipelineSettings",
+    t0_utc: datetime,
+) -> None:
+    """
+    Build & write addresspoints and lowwatercrossings status.
+    Preserves original fields, adds 'Situation' and 'id' (PK).
+    """
+    # 1) Build status GDFs
+    addr_status = _status_from_points(settings.points.address_gpkg, layer=settings.points.address_layer, fim_polys_5070=fim_polys_5070)
+    lwc_status  = _status_from_points(settings.points.lwc_gpkg,     layer=settings.points.lwc_layer, fim_polys_5070=fim_polys_5070)
+
+    # 2) Add id (OBJECTID_t0_valid_time) and dedupe
+    addr_status = _apply_point_ids(addr_status)
+    lwc_status  = _apply_point_ids(lwc_status)
+
+    # 3) Ensure we have t0/valid_time columns in the frames (needed for indexing/idempotent delete)
+    if "t0" not in addr_status.columns:  addr_status["t0"] = pd.Timestamp(t0_utc, tz="UTC")
+    if "valid_time" not in addr_status.columns: addr_status["valid_time"] = pd.Timestamp(t0_utc, tz="UTC")
+    if "t0" not in lwc_status.columns:   lwc_status["t0"]  = pd.Timestamp(t0_utc, tz="UTC")
+    if "valid_time" not in lwc_status.columns: lwc_status["valid_time"] = pd.Timestamp(t0_utc, tz="UTC")
+
+    # 4) Write to PostGIS (keeps all original columns)
+    if settings.out.MODE in ("postgis","both","all"):
+        _write_points_table_postgis(
+            addr_status, table="addresspoints", schema=settings.out.PG_SCHEMA, dsn=settings.out.PG_DSN, t0_utc=t0_utc
+        )
+        _write_points_table_postgis(
+            lwc_status, table="lowwatercrossings", schema=settings.out.PG_SCHEMA, dsn=settings.out.PG_DSN, t0_utc=t0_utc
+        )
+
+    # 5) Optional file/S3 exports (unchanged naming; no FIM_* column renames)
+    stamp = t0_utc.strftime("%Y%m%d%H%MZ")
+    if settings.out.MODE in ("local","both","all") and settings.out.LOCAL_OUT_DIR:
+        out_dir = Path(settings.out.LOCAL_OUT_DIR); out_dir.mkdir(parents=True, exist_ok=True)
+        ap = out_dir / f"address_status_{stamp}.gpkg"
+        lw = out_dir / f"lwc_status_{stamp}.gpkg"
+        addr_status.to_file(ap, layer="address_status", driver="GPKG")
+        lwc_status.to_file(lw, layer="lwc_status", driver="GPKG")
+        # S3 mirror if configured (using your existing FIM S3 routing)
+        try:
+            # fs = _get_s3_filesystem(settings)
+            # bucket = settings.out.FIM_S3_BUCKET or settings.out.S3_BUCKET
+            # prefix = settings.out.FIM_S3_PREFIX or settings.out.S3_PREFIX
+            # if bucket:
+            #     _s3_upload_files(fs, bucket, prefix, [ap, lw])
+            if settings.out.FIM_S3_BUCKET:
+                key = f"{settings.out.FIM_S3_PREFIX.rstrip('/')}/{ap.name}"
+                _upload_to_s3(ap, settings.out.FIM_S3_BUCKET, key)
+                logger.info("S3 upload of AP status file is successful: %r", key)
+                key = f"{settings.out.FIM_S3_PREFIX.rstrip('/')}/{lw.name}"
+                _upload_to_s3(lw, settings.out.FIM_S3_BUCKET, key)
+                logger.info("S3 upload of LWC status file is successful: %r", key)
+        except Exception as exc:
+            logger.warning("S3 upload of point status files failed: %r", exc)
+
+
+def _status_points_for_snapshot(
+    pts_5070: gpd.GeoDataFrame,
+    fim_slice_5070: gpd.GeoDataFrame,
+    t0_u: pd.Timestamp,
+    vt_u: pd.Timestamp,
+) -> gpd.GeoDataFrame:
+    """
+    Build a status layer for ONE snapshot:
+      - Keep ALL original point columns
+      - Add: Situation ('Flooded'|'Safe'), t0, valid_time (UTC), id=<OBJECTID>_<t0Z>_<validZ>
+    """
+    if pts_5070.empty:
+        return pts_5070.copy()
+
+    # point-in-polygon: flooded set
+    flooded = gpd.sjoin(
+        pts_5070[["OBJECTID", "geometry"]],
+        fim_slice_5070[["geometry"]],
+        how="inner",
+        predicate="within",
+    )
+    flooded_ids = set(flooded["OBJECTID"].tolist())
+
+    g = pts_5070.copy()
+    g["Situation"] = g["OBJECTID"].isin(flooded_ids).map({True: "Flooded", False: "Safe"})
+
+    t0_utc = _as_utc(t0_u)
+    vt_utc = _as_utc(vt_u)
+    g["t0"] = t0_utc
+    g["valid_time"] = vt_utc
+
+    # id = <OBJECTID>_<t0Z>_<validZ> using normalized UTC timestamps
+    t0z = t0_utc.strftime("%Y%m%d%H%MZ")
+    vtz = vt_utc.strftime("%Y%m%d%H%MZ")
+    g["id"] = g["OBJECTID"].astype(str) + f"_{t0z}_{vtz}"
+
+    return g.drop_duplicates(subset=["id"], keep="first")
+
+
+
+def _write_points_table_postgis(
+    gdf: gpd.GeoDataFrame,
+    *,
+    table: str,
+    schema: str,
+    dsn: str,
+    t0_utc: datetime,
+    vt_utc: datetime,
+) -> None:
+    """
+    Append snapshot rows to PostGIS; ensures PK(id) + indexes (id, t0, valid_time, OBJECTID).
+    Idempotent per (t0, valid_time): deletes only rows for this snapshot before append.
+
+    DDL is executed in AUTOCOMMIT to avoid poisoning a transaction if a DDL step errors.
+    """
+    engine = create_engine(dsn)
+
+    # 1) Minimal bootstrap: ensure schema + create table structure (no rows) if missing
+    with engine.begin() as tx:
+        tx.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        # structure-only write (0 rows) so to_postgis lays out geometry/columns if table doesn't exist
+        gdf.head(0).to_postgis(name=table, con=tx, schema=schema, if_exists="append", index=False)
+
+    # 2) DDL in autocommit, each statement isolated
+    def _ddl(sql: str, params: dict | None = None):
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as cx:
+            cx.execute(text(sql), params or {})
+
+    # Ensure expected columns exist (best effort)
+    for col_sql in (
+        f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS id text',
+        f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "t0" timestamptz',
+        f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "valid_time" timestamptz',
+        f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "Situation" text',
+    ):
+        try:
+            _ddl(col_sql)
+        except Exception as _:
+            # ignore type mismatches or concurrent races; table already conforms enough
+            pass
+
+    # Primary key on id (run once; ignore if already present or if duplicates exist initially)
+    try:
+        _ddl(
+            f'ALTER TABLE "{schema}"."{table}" '
+            f'ADD CONSTRAINT "{table}_pkey" PRIMARY KEY ("id")'
+        )
+    except Exception:
+        pass  # already there or data not yet unique; inserts will still work
+
+    # Helpful indexes (also safe to re-run)
+    for sql in (
+        f'CREATE INDEX IF NOT EXISTS "{table}_t0_valid_idx" ON "{schema}"."{table}" ("t0","valid_time")',
+        f'CREATE INDEX IF NOT EXISTS "{table}_id_idx" ON "{schema}"."{table}" ("id")',
+        f'CREATE INDEX IF NOT EXISTS "{table}_t0_idx" ON "{schema}"."{table}" ("t0")',
+        f'CREATE INDEX IF NOT EXISTS "{table}_valid_time_idx" ON "{schema}"."{table}" ("valid_time")',
+        f'CREATE INDEX IF NOT EXISTS "{table}_OBJECTID_idx" ON "{schema}"."{table}" ("OBJECTID")',
+    ):
+        try:
+            _ddl(sql)
+        except Exception:
+            pass
+
+    # 3) DML: delete the exact snapshot and append rows in a clean transaction
+    with engine.begin() as tx:
+        tx.execute(
+            text(
+                f'DELETE FROM "{schema}"."{table}" '
+                f'WHERE "t0" = :t0 AND "valid_time" = :vt'
+            ),
+            {"t0": t0_utc, "vt": vt_utc},
+        )
+        gdf.to_postgis(name=table, con=tx, schema=schema, if_exists="append", index=False)
+
+
+def _write_points_snapshot_outputs(
+    *,
+    gdf: gpd.GeoDataFrame,
+    layer_name: str,
+    t0_u: pd.Timestamp,
+    vt_u: pd.Timestamp,
+    settings: "PipelineSettings",
+) -> None:
+    """
+    Optional local + S3 snapshot outputs for a points layer. Mirrors your existing S3 helper usage.
+    """
+    stamp_t0 = t0_u.strftime("%Y%m%d%H%MZ")
+    stamp_vt = vt_u.strftime("%Y%m%d%H%MZ")
+    if settings.out.MODE in ("local", "both", "all") and settings.out.LOCAL_OUT_DIR:
+        out_dir = Path(settings.out.LOCAL_OUT_DIR); out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{layer_name}_{stamp_t0}_{stamp_vt}.gpkg"
+        gdf.to_file(out_path, layer=layer_name, driver="GPKG")
+
+        # S3 mirror (re-use your _upload_to_s3 + FIM_* settings)
+        try:
+            if settings.out.FIM_S3_BUCKET:
+                prefix = (settings.out.FIM_S3_PREFIX or "").rstrip("/")
+                key = f"{prefix}/{out_path.name}" if prefix else out_path.name
+                _upload_to_s3(out_path, settings.out.FIM_S3_BUCKET, key)
+        except Exception as exc:
+            logger.warning("S3 upload of %s failed: %r", out_path.name, exc)
+
+
+
+# -----------------------------------------------------------------------------
 # Public API: Forecast retrieval
 # -----------------------------------------------------------------------------
+
+def write_point_status_for_snapshot(
+    *,
+    fim_slice_5070: gpd.GeoDataFrame,
+    t0_u: pd.Timestamp,
+    vt_u: pd.Timestamp,
+    settings: "PipelineSettings",
+) -> None:
+    """
+    Compute & persist **per-snapshot** point status for addresspoints and lowwatercrossings.
+    """
+    if fim_slice_5070.empty:
+        return
+
+    # Load points once; enforce CRS 5070
+    addr_pts = _ensure_epsg_5070(gpd.read_file(settings.points.address_gpkg, layer=settings.points.address_layer))
+    lwc_pts  = _ensure_epsg_5070(gpd.read_file(settings.points.lwc_gpkg, layer=settings.points.lwc_layer))
+    fim_slice_5070 = _ensure_epsg_5070(fim_slice_5070)
+
+    # Build snapshot layers
+    addr_status = _status_points_for_snapshot(addr_pts, fim_slice_5070, t0_u, vt_u)
+    lwc_status  = _status_points_for_snapshot(lwc_pts,  fim_slice_5070, t0_u, vt_u)
+
+    # PostGIS
+    if settings.out.MODE in ("postgis", "both", "all"):
+        _write_points_table_postgis(
+            addr_status,
+            table="addresspoints",
+            schema=settings.out.PG_SCHEMA,
+            dsn=settings.out.PG_DSN,
+            t0_utc=t0_u.to_pydatetime(),
+            vt_utc=vt_u.to_pydatetime(),
+        )
+        _write_points_table_postgis(
+            lwc_status,
+            table="lowwatercrossings",
+            schema=settings.out.PG_SCHEMA,
+            dsn=settings.out.PG_DSN,
+            t0_utc=t0_u.to_pydatetime(),
+            vt_utc=vt_u.to_pydatetime(),
+        )
+
+    # Local/S3 snapshot files (same namespacing as other writers)
+    _write_points_snapshot_outputs(
+        gdf=addr_status, layer_name="address_status", t0_u=t0_u, vt_u=vt_u, settings=settings
+    )
+    _write_points_snapshot_outputs(
+        gdf=lwc_status, layer_name="lwc_status", t0_u=t0_u, vt_u=vt_u, settings=settings
+    )
+
+
+# def process_point_status_against_fim(
+#     fim_polygons_5070: gpd.GeoDataFrame,
+#     settings: "PipelineSettings",
+#     *,
+#     t0_utc: datetime,
+# ) -> None:
+#     """
+#     Build status layers (Safe/Flooded) for address_points and lowwatercrossings.
+#     """
+#     epsg = settings.points.target_epsg if hasattr(settings, "points") else 5070
+#     if fim_polygons_5070.crs is None or fim_polygons_5070.crs.to_epsg() != epsg:
+#         fim_polygons_5070 = fim_polygons_5070.set_crs(epsg) if fim_polygons_5070.crs is None else fim_polygons_5070.to_crs(epsg)
+
+#     # Load point layers and enforce CRS
+#     addr = _load_points_layer(settings.points.address_gpkg, settings.points.address_layer, epsg)
+#     lwc  = _load_points_layer(settings.points.lwc_gpkg, settings.points.lwc_layer, epsg)
+
+#     # Compute status
+#     addr_status = _points_status_against_fim(
+#         addr, fim_polygons_5070,
+#         source_name="address",
+#         point_id_column=settings.points.point_id_column,
+#         t0_utc=t0_utc,
+#     )
+#     lwc_status = _points_status_against_fim(
+#         lwc, fim_polygons_5070,
+#         source_name="lwc",
+#         point_id_column=settings.points.point_id_column,
+#         t0_utc=t0_utc,
+#     )
+
+#     # Write outputs
+#     _write_point_status_outputs(addr_status, base_name="address_status", settings=settings, t0_utc=t0_utc)
+#     _write_point_status_outputs(lwc_status,  base_name="lwc_status",    settings=settings, t0_utc=t0_utc)
+
+
+
 
 def find_latest_t0(
     settings: PipelineSettings,
@@ -1976,7 +2597,7 @@ def refresh_fim_materialized_views(settings: "PipelineSettings") -> None:
     out = settings.out
 
     # Only relevant if we're actually writing to PostGIS.
-    if out.MODE not in ("postgis", "both"):
+    if out.MODE not in ("postgis", "both","all"):
         logger.debug(
             "PostGIS output disabled (OUT_MODE=%s); skipping FIM matview refresh.",
             out.MODE,
@@ -1988,7 +2609,7 @@ def refresh_fim_materialized_views(settings: "PipelineSettings") -> None:
         return
 
     # These names must match what `geoserver_init.py` creates.
-    matviews = ("fim_nowcast", "fim_max")
+    matviews = ("fim_nowcast", "fim_max","addresspoints_nowcast","lowwatercrossings_nowcast")
 
     logger.info(
         "Refreshing FIM materialized views %s in schema '%s'.",
@@ -2013,7 +2634,7 @@ def generate_all_fim_layers(
     df_forecast: pd.DataFrame,
     settings: PipelineSettings,
     flowlines: Optional[gpd.GeoDataFrame] = None,
-) -> None:
+) -> None | gpd.GeoDataFrame:
     """
     Generate and persist FIM polygons for each unique forecast_time.
 
@@ -2061,10 +2682,32 @@ def generate_all_fim_layers(
         if fim_gdf.empty:
             continue
 
+        # 1) write the snapshot polygons
         suffix = valid_time.strftime("%Y%m%d%H%M")
         write_fim(fim_gdf, settings, time_suffix=suffix)
 
+
+        # 2) immediately compute & write the **per-snapshot** point status
+        # try:
+        write_point_status_for_snapshot(
+            fim_slice_5070=fim_gdf,      # snapshot polygons you just wrote
+            t0_u=pd.to_datetime(t0, utc=True),
+            vt_u=pd.to_datetime(valid_time, utc=True),
+            settings=settings,
+        )
+        # except Exception as exc:
+        #     logger.warning(
+        #         "Point status generation failed for snapshot t0=%s vt=%s: %r",
+        #         pd.to_datetime(t0, utc=True).isoformat(),
+        #         pd.to_datetime(valid_time, utc=True).isoformat(),
+        #         exc,
+        #     )
+
+        last_fim = fim_gdf
+
     logger.info("Finished generating FIM layers for all forecast_time values.")
+
+    return last_fim
 
 
 # -----------------------------------------------------------------------------
@@ -2111,6 +2754,15 @@ def main() -> None:
         settings=settings,
         flowlines=flowlines,
     )
+
+    # # try:
+    # write_point_status_layers(
+    #     fim_polys_5070=fim_polys_5070,   # the polygons you just generated/published (EPSG:5070)
+    #     settings=settings,
+    #     t0_utc=t0,
+    # )
+    # # except Exception as exc:
+    # #     logger.error("Point status generation failed for t0=%s: %s", t0.isoformat(), exc)
 
     logger.info("NWM SR → AOI Flowlines → FIM pipeline completed.")
 
