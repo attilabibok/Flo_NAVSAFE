@@ -223,6 +223,8 @@ class OutputSettings(BaseSettings):
     # Optional S3 outputs for per-snapshot files
     FIM_S3_BUCKET: Optional[str] = None
     FIM_S3_PREFIX: str = ""  # e.g. "tcso/fim/"
+    FIM_S3_ACCESS_KEY_ID: Optional[str] = None
+    FIM_S3_ACCESS_TOKEN: Optional[str] = None
 
     # Optional S3 key for a "live" GeoJSON pointing to latest snapshot
     FIM_S3_LIVE_KEY: Optional[str] = None
@@ -387,6 +389,11 @@ def _input_s3_client() -> Optional[s3fs.S3FileSystem]:
     access_token = os.getenv("INPUT_S3_ACCESS_TOKEN")
 
     if not access_key or not access_token:
+        logger.info(
+            "INPUT_S3 credentials not fully set (id=%s, token=%s); skipping S3 client.",
+            bool(access_key),
+            bool(access_token),
+        )
         return None
 
     return s3fs.S3FileSystem(
@@ -407,13 +414,24 @@ def _ensure_input_asset(path: Path, *, required: bool = True) -> Path:
     required : bool
         Raise FileNotFoundError if the asset is still missing after attempts.
     """
+    path = path.expanduser()
+    logger.info("Ensuring input asset at %s", path)
+
     if path.exists():
+        logger.debug("Input asset already present locally: %s", path)
         return path
 
     bucket = os.getenv("INPUT_S3_BUCKET")
+    prefix = os.getenv("INPUT_S3_PREFIX", "").strip("/")
     fs = _input_s3_client()
 
     if not bucket or fs is None:
+        logger.warning(
+            "Input asset missing locally (%s) and INPUT_S3 not configured; bucket=%s client=%s",
+            path,
+            bucket,
+            fs is not None,
+        )
         if required:
             raise FileNotFoundError(
                 f"Input asset missing at {path} and INPUT_S3_* env vars are not fully set."
@@ -421,8 +439,11 @@ def _ensure_input_asset(path: Path, *, required: bool = True) -> Path:
         return path
 
     key = path.as_posix().lstrip("/")
+    if prefix:
+        key = f"{prefix}/{key}"
     s3_uri = f"{bucket.rstrip('/')}/{key}"
 
+    logger.info("Attempting to download input asset from s3://%s to %s", s3_uri, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with fs.open(s3_uri, "rb") as src, path.open("wb") as dst:
@@ -2302,11 +2323,21 @@ def _parse_formats(out: OutputSettings) -> List[str]:
 def _s3_filesystem_rw() -> s3fs.S3FileSystem:
     """
     Create an S3 filesystem client for writing.
+    Uses explicit OUT_FIM_S3_ACCESS_KEY_ID/OUT_FIM_S3_ACCESS_TOKEN if set,
+    otherwise falls back to default credential resolution.
 
     Returns
     -------
     s3fs.S3FileSystem
     """
+    key = os.getenv("OUT_FIM_S3_ACCESS_KEY_ID")
+    secret = os.getenv("OUT_FIM_S3_ACCESS_TOKEN")
+
+    if key and secret:
+        logger.info("Initializing authenticated S3 client for FIM outputs using OUT_FIM_S3_* credentials.")
+        return s3fs.S3FileSystem(anon=False, key=key, secret=secret)
+
+    logger.info("Initializing S3 client for FIM outputs using default credentials.")
     return s3fs.S3FileSystem(anon=False)
 
 
