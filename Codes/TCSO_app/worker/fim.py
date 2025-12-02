@@ -116,6 +116,7 @@ import os
 import re
 import time
 import io
+import shutil
 import requests
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -375,6 +376,69 @@ def _ensure_multipolygon(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     df["geometry"] = df["geometry"].map(_to_multi)
     return df
+
+
+def _input_s3_client() -> Optional[s3fs.S3FileSystem]:
+    """
+    Build an authenticated S3 client for input downloads.
+    Returns None if credentials are incomplete.
+    """
+    access_key = os.getenv("INPUT_S3_ACCESS_KEY_ID")
+    access_token = os.getenv("INPUT_S3_ACCESS_TOKEN")
+
+    if not access_key or not access_token:
+        return None
+
+    return s3fs.S3FileSystem(
+        anon=False,
+        key=access_key,
+        secret=access_token,
+    )
+
+
+def _ensure_input_asset(path: Path, *, required: bool = True) -> Path:
+    """
+    Ensure a local input file exists, fetching it from S3 if needed.
+
+    Parameters
+    ----------
+    path : Path
+        Local path where the asset should live.
+    required : bool
+        Raise FileNotFoundError if the asset is still missing after attempts.
+    """
+    if path.exists():
+        return path
+
+    bucket = os.getenv("INPUT_S3_BUCKET")
+    fs = _input_s3_client()
+
+    if not bucket or fs is None:
+        if required:
+            raise FileNotFoundError(
+                f"Input asset missing at {path} and INPUT_S3_* env vars are not fully set."
+            )
+        return path
+
+    key = path.as_posix().lstrip("/")
+    s3_uri = f"{bucket.rstrip('/')}/{key}"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with fs.open(s3_uri, "rb") as src, path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+        logger.info("Downloaded input asset from s3://%s to %s", s3_uri, path)
+    except FileNotFoundError:
+        logger.error("Input asset not found in S3: s3://%s", s3_uri)
+    except Exception as exc:
+        logger.error(
+            "Failed to download input asset s3://%s -> %s: %s", s3_uri, path, exc
+        )
+
+    if required and not path.exists():
+        raise FileNotFoundError(f"Input asset not available at {path} (S3 key: {s3_uri})")
+
+    return path
 
 
 def _load_streamflow_slice(
@@ -1688,9 +1752,7 @@ def load_flowlines(settings: PipelineSettings) -> gpd.GeoDataFrame:
         If the configured ID field is not present.
     """
     fim = settings.fim
-    path = Path(fim.FLOWLINES_GPKG)
-    if not path.exists():
-        raise FileNotFoundError(f"AOI flowlines GPKG not found: {path}")
+    path = _ensure_input_asset(Path(fim.FLOWLINES_GPKG))
 
     if fim.FLOWLINES_LAYER:
         gdf = gpd.read_file(path, layer=fim.FLOWLINES_LAYER)
@@ -1857,7 +1919,9 @@ def load_rating_curves(fim: FIMSettings) -> pd.DataFrame:
     """
     import sqlite3
 
-    with sqlite3.connect(fim.GPKG) as con:
+    gpkg_path = _ensure_input_asset(Path(fim.GPKG))
+
+    with sqlite3.connect(gpkg_path) as con:
         df = pd.read_sql(
             f"""
             SELECT
@@ -1954,7 +2018,8 @@ def read_fim_bounds(fim: FIMSettings) -> pd.DataFrame:
     pd.DataFrame
         Columns: [HydroID, Hmin, Hmax]
     """
-    fim_gdf = gpd.read_file(fim.GPKG, layer=fim.FIM_LAYER)[
+    gpkg_path = _ensure_input_asset(Path(fim.GPKG))
+    fim_gdf = gpd.read_file(gpkg_path, layer=fim.FIM_LAYER)[
         [fim.FLOWLINES_HYDRO_FIELD, "HIndex"]
     ]
     fim_gdf[fim.FLOWLINES_HYDRO_FIELD] = pd.to_numeric(
@@ -1990,7 +2055,8 @@ def select_polys_exact(
     geopandas.GeoDataFrame
         Matching polygons.
     """
-    fim_gdf = gpd.read_file(fim.GPKG, layer=fim.FIM_LAYER)
+    gpkg_path = _ensure_input_asset(Path(fim.GPKG))
+    fim_gdf = gpd.read_file(gpkg_path, layer=fim.FIM_LAYER)
     hf = fim.FLOWLINES_HYDRO_FIELD
 
     fim_gdf[hf] = pd.to_numeric(fim_gdf[hf], errors="coerce")
@@ -2058,7 +2124,8 @@ def generate_fim_snapshot(
     lake_missing = fim.LAKE_MISSING
 
     # Load all FIM polygons once
-    fim_polys_all = gpd.read_file(fim.GPKG, layer=fim.FIM_LAYER)
+    gpkg_path = _ensure_input_asset(Path(fim.GPKG))
+    fim_polys_all = gpd.read_file(gpkg_path, layer=fim.FIM_LAYER)
     fim_polys_all = fim_polys_all.copy()
     fim_polys_all[hf] = pd.to_numeric(fim_polys_all[hf], errors="coerce")
     fim_polys_all["HIndex"] = pd.to_numeric(fim_polys_all["HIndex"], errors="coerce")
