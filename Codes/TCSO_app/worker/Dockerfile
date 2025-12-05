@@ -25,5 +25,3 @@ COPY fim.py nwm_fim_worker.py run_single_t0.py run_range.py geoserver_init.py ./
 # Default: run the FastAPI worker
 
 CMD ["uvicorn", "nwm_fim_worker:app", "--host", "0.0.0.0", "--port", "8000"]
-
-

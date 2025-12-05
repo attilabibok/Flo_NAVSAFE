@@ -87,6 +87,13 @@ services:
       NWM_VARIABLE: streamflow
       NWM_LOOKBACK_DAYS: 4
 
+      WORKER_MAX_LEAD_HOURS: 4
+
+      # input s3 creds
+      # INPUT_S3_BUCKET: my-input-bucket
+      # INPUT_S3_ACCESS_KEY_ID: myaccesskey
+      # INPUT_S3_ACCESS_TOKEN: mytoken
+
       FIM_GPKG: /data/Theme4Data.gpkg
       FIM_FLOWLINES_GPKG: /data/p2fflowlines_tcso.gpkg
       FIM_FIM_LAYER: TravisFIM
@@ -102,15 +109,16 @@ services:
 
       # file export base; worker writes here (and S3 if configured in fim.py)
       OUT_GPKG_PATH: /data/output/nwm_fim.gpkg
-      OUT_FIM_FORMATS: "gpkg,geojson"
+      OUT_FIM_FORMATS: "geojson"
+
 
       #points
       ADDRESS_GPKG: /data/addresspoints.gpkg
       LWC_GPKG: /data/lowwatercrossingsall.gpkg
 
       # optional S3 export (used by fim.py write_fim)
-      # OUT_FIM_S3_BUCKET: my-fim-bucket
-      # OUT_FIM_S3_PREFIX: tcso/fim
+      # OUT_FIM_S3_BUCKET: knatempstorage
+      # OUT_FIM_S3_PREFIX: tcso/output
       # OUT_FIM_S3_LIVE_KEY: FIM_TCSO_live.geojson
 
       # TZ: America/New_York

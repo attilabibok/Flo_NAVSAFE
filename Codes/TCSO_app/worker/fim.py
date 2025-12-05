@@ -1094,9 +1094,13 @@ def _apply_point_ids(gdf_status: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     UTC zero time for the stamp so the id remains deterministic per OBJECTID+t0 window.
     Then de-duplicate on 'id'.
     """
-    # Fill missing times deterministically (00Z) for Safe points
-    t0_filled = pd.to_datetime(gdf_status.get("t0")).dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT").fillna(pd.Timestamp("1970-01-01T00:00:00Z"))
-    vt_filled = pd.to_datetime(gdf_status.get("valid_time")).dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT").fillna(pd.Timestamp("1970-01-01T00:00:00Z"))
+    # Normalize to UTC and fill missing deterministically (00Z) for Safe points.
+    t0_filled = pd.to_datetime(gdf_status.get("t0"), errors="coerce", utc=True).fillna(
+        pd.Timestamp("1970-01-01T00:00:00Z")
+    )
+    vt_filled = pd.to_datetime(gdf_status.get("valid_time"), errors="coerce", utc=True).fillna(
+        pd.Timestamp("1970-01-01T00:00:00Z")
+    )
 
     # OBJECTID can be int or str; coerce to str
     obj = gdf_status["OBJECTID"].astype(str)
@@ -1112,81 +1116,103 @@ def _apply_point_ids(gdf_status: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf_status
 
 
-def _write_points_table_postgis(
-    gdf: gpd.GeoDataFrame,
-    *,
-    table: str,
-    schema: str,
-    dsn: str,
-    t0_utc: datetime,
-) -> None:
-    """
-    Write gdf to PostGIS keeping all original columns, plus:
-      - id (PRIMARY KEY)
-      - Situation (text)
-    Idempotent per t0: deletes any rows with the same t0 before append.
-    Also builds indexes on (t0), (valid_time), and (OBJECTID).
-    """
-    if gdf.empty:
-        return
+# def _write_points_table_postgis(
+#     gdf: gpd.GeoDataFrame,
+#     *,
+#     table: str,
+#     schema: str,
+#     dsn: str,
+#     t0_utc: datetime,
+# ) -> None:
+#     """
+#     Write gdf to PostGIS keeping all original columns, plus:
+#       - id (PRIMARY KEY)
+#       - Situation (text)
+#     Idempotent per t0: deletes any rows with the same t0 before append.
+#     Also builds indexes on (t0), (valid_time), and (OBJECTID).
+#     """
+#     if gdf.empty:
+#         return
 
-    gdf = _ensure_epsg_5070(gdf)
+#     gdf = _ensure_epsg_5070(gdf)
 
-    engine = create_engine(dsn)
-    with engine.begin() as conn:
-        # If table exists, wipe same t0 to keep idempotent
-        exists = conn.execute(text("""
-            SELECT EXISTS (
-              SELECT 1 FROM information_schema.tables
-              WHERE table_schema = :schema AND table_name = :table
-            )
-        """), {"schema": schema, "table": table}).scalar()
+#     engine = create_engine(dsn)
+#     with engine.begin() as conn:
+#         # If table exists, wipe same t0 to keep idempotent
+#         exists = conn.execute(text("""
+#             SELECT EXISTS (
+#               SELECT 1 FROM information_schema.tables
+#               WHERE table_schema = :schema AND table_name = :table
+#             )
+#         """), {"schema": schema, "table": table}).scalar()
 
-        if exists:
-            conn.execute(text(f'DELETE FROM "{schema}"."{table}" WHERE t0 = :t0')), {"t0": t0_utc}
-        # Append (creates table if not exists, including all original columns + id + Situation)
-        gdf.to_postgis(name=table, con=conn.connection, schema=schema, if_exists="append", index=False)
+#         if exists:
+#             logger.info(
+#                 "Point status: deleting existing %s.%s rows for t0=%s",
+#                 schema,
+#                 table,
+#                 t0_utc.isoformat(),
+#             )
+#             conn.execute(
+#                 text(f'DELETE FROM "{schema}"."{table}" WHERE t0 = :t0'),
+#                 {"t0": t0_utc},
+#             )
+#         # Append (creates table if not exists, including all original columns + id + Situation)
+#         logger.info(
+#             "Point status: writing %d rows to %s.%s",
+#             len(gdf),
+#             schema,
+#             table,
+#         )
+#         gdf.to_postgis(name=table, con=conn.connection, schema=schema, if_exists="append", index=False)
+#         logger.info(
+#             "Point status: wrote %d rows to %s.%s",
+#             len(gdf),
+#             schema,
+#             table,
+#         )
 
-        # Ensure PK + helpful indexes (safe / if-not-exists)
-        # 1) Add PK if not present
-        has_pk = conn.execute(text("""
-            SELECT COUNT(*) FROM information_schema.table_constraints
-            WHERE table_schema=:schema AND table_name=:table AND constraint_type='PRIMARY KEY'
-        """), {"schema": schema, "table": table}).scalar()
-        if not has_pk:
-            # Need unique index first (faster & avoids lock if dup)
-            conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{table}_id_key" ON "{schema}"."{table}" (id)'))
-            conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD CONSTRAINT "{table}_pkey" PRIMARY KEY (id)'))
+#         # Ensure PK + helpful indexes (safe / if-not-exists)
+#         # 1) Add PK if not present
+#         has_pk = conn.execute(text("""
+#             SELECT COUNT(*) FROM information_schema.table_constraints
+#             WHERE table_schema=:schema AND table_name=:table AND constraint_type='PRIMARY KEY'
+#         """), {"schema": schema, "table": table}).scalar()
+#         if not has_pk:
+#             # Need unique index first (faster & avoids lock if dup)
+#             conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "{table}_id_key" ON "{schema}"."{table}" (id)'))
+#             conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD CONSTRAINT "{table}_pkey" PRIMARY KEY (id)'))
 
-        conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_t0_idx" ON "{schema}"."{table}" (t0)'))
-        if "valid_time" in gdf.columns:
-            conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_valid_time_idx" ON "{schema}"."{table}" (valid_time)'))
-        if "OBJECTID" in gdf.columns:
-            conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_objectid_idx" ON "{schema}"."{table}" ("OBJECTID")'))
+#         conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_t0_idx" ON "{schema}"."{table}" (t0)'))
+#         if "valid_time" in gdf.columns:
+#             conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_valid_time_idx" ON "{schema}"."{table}" (valid_time)'))
+#         if "OBJECTID" in gdf.columns:
+#             conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table}_objectid_idx" ON "{schema}"."{table}" ("OBJECTID")'))
 
 
-def _load_points_layer(path: str, layer: str, target_epsg: int) -> gpd.GeoDataFrame:
-    """
-    Read a GeoPackage point layer and reproject to target_epsg if needed.
-    Ensures geometry type is POINT and drops empties.
-    """
-    gdf = gpd.read_file(path, layer=layer)
-    if gdf.empty:
-        return gdf
+# def _load_points_layer(path: str, layer: str, target_epsg: int) -> gpd.GeoDataFrame:
+#     """
+#     Read a GeoPackage point layer and reproject to target_epsg if needed.
+#     Ensures geometry type is POINT and drops empties.
+#     """
+#     gpkg_path = _ensure_input_asset(Path(path))
+#     gdf = gpd.read_file(gpkg_path, layer=layer)
+#     if gdf.empty:
+#         return gdf
 
-    if gdf.crs is None:
-        raise ValueError(f"Points layer '{layer}' has no CRS defined: {path}")
+#     if gdf.crs is None:
+#         raise ValueError(f"Points layer '{layer}' has no CRS defined: {path}")
 
-    if gdf.crs.to_epsg() != target_epsg:
-        gdf = gdf.to_crs(target_epsg)
+#     if gdf.crs.to_epsg() != target_epsg:
+#         gdf = gdf.to_crs(target_epsg)
 
-    # keep only valid points
-    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notnull()]
-    if not all(gdf.geometry.geom_type.isin(["Point"])):
-        # silently cast centroids if some are multipoints? — Prefer strict fail:
-        raise ValueError(f"Layer '{layer}' must be POINT geometries.")
+#     # keep only valid points
+#     gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notnull()]
+#     if not all(gdf.geometry.geom_type.isin(["Point"])):
+#         # silently cast centroids if some are multipoints? — Prefer strict fail:
+#         raise ValueError(f"Layer '{layer}' must be POINT geometries.")
 
-    return gdf
+#     return gdf
 
 
 # --- Spatial join: points within FIM polygons --------------------------------
@@ -1207,8 +1233,12 @@ def _status_from_points(
         "<HydroID>_<t0UTC>_<validUTC>" when HydroID/t0/valid_time exist, else NaN
       - HydroID, HIndex, HValue, t0, valid_time from the matched polygon (NaN if none)
     """
-    pts = gpd.read_file(points_gpkg, layer=layer)
+    gpkg_path = _ensure_input_asset(Path(points_gpkg))
+    logger.info("Point status: reading %s (layer=%s)", gpkg_path, layer)
+    pts = gpd.read_file(gpkg_path, layer=layer)
+    logger.info("Point status: loaded %d points from %s", len(pts), gpkg_path)
     pts = _ensure_epsg_5070(pts)
+    logger.info("Point status: CRS normalized to EPSG:5070 for %s", layer)
 
     # If no polygons, mark everything Safe and add empty columns.
     if fim_polys_5070.empty:
@@ -1227,8 +1257,36 @@ def _status_from_points(
 
     fim_view = fim_polys_5070[poly_cols].copy()
 
-    # Spatial join: points within polygons
-    j = gpd.sjoin(pts, fim_view, how="left", predicate="within")
+    # Spatial join: points within polygons (chunked to reduce memory pressure)
+    chunk_size = int(os.getenv("POINTS_SJOIN_CHUNK", "50000"))
+    logger.info(
+        "Point status: spatial join start for %s; points=%d polygons=%d chunk=%d",
+        layer,
+        len(pts),
+        len(fim_view),
+        chunk_size,
+    )
+    chunks = []
+    for start in range(0, len(pts), chunk_size):
+        end = min(start + chunk_size, len(pts))
+        part = pts.iloc[start:end]
+        j_part = gpd.sjoin(part, fim_view, how="left", predicate="within")
+        chunks.append(j_part)
+        logger.info(
+            "Point status: chunk %s-%s joined (%d matched, %d unmatched)",
+            start,
+            end,
+            len(j_part) - j_part["index_right"].isna().sum(),
+            j_part["index_right"].isna().sum(),
+        )
+    j = pd.concat(chunks, ignore_index=True) if chunks else pts.iloc[0:0]
+    matched = len(j) - j["index_right"].isna().sum()
+    logger.info(
+        "Point status: spatial join done for %s; matched=%d unmatched=%d",
+        layer,
+        matched,
+        j["index_right"].isna().sum(),
+    )
 
     # Normalize output fields
     if has_id:
@@ -1257,6 +1315,55 @@ def _status_from_points(
         j = j.drop(columns=["index_right"])
 
     return j
+
+
+def _ensure_static_points_loaded(
+    *,
+    table: str,
+    gpkg_path: Path,
+    layer: str,
+    dsn: str,
+    target_epsg: int = 5070,
+) -> None:
+    """
+    Ensure a static points table exists/has data; populate from the GPKG once if empty.
+    """
+    if create_engine is None or not dsn:
+        return
+
+    engine = create_engine(dsn)
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text(
+                "SELECT to_regclass(:regclass) IS NOT NULL"
+            ),
+            {"regclass": f"public.{table}"},
+        ).scalar()
+        count = 0
+        if exists:
+            count = conn.execute(
+                text(f'SELECT COUNT(*) FROM "public"."{table}"')
+            ).scalar() or 0
+
+    if exists and count > 0:
+        logger.info("Static points table %s already populated (%d rows); skipping.", table, count)
+        return
+
+    logger.info("Loading static points into %s from %s (layer=%s)", table, gpkg_path, layer)
+    pts = gpd.read_file(gpkg_path, layer=layer)
+    pts = _ensure_epsg_5070(pts)
+    # Only static attrs + geometry; drop runtime status cols if any linger
+    drop_cols = {"Situation", "t0", "valid_time", "id", "match_fim_id", "HydroID", "HIndex", "HValue"}
+    pts = pts[[c for c in pts.columns if c not in drop_cols]]
+
+    pts.to_postgis(
+        name=table,
+        con=dsn,
+        schema="public",
+        if_exists="replace",
+        index=False,
+    )
+    logger.info("Static points table %s populated (%d rows).", table, len(pts))
 
 def _points_status_against_fim(
     points_5070: gpd.GeoDataFrame,
@@ -1367,7 +1474,32 @@ def write_point_status_layers(
     Build & write addresspoints and lowwatercrossings status.
     Preserves original fields, adds 'Situation' and 'id' (PK).
     """
+    logger.info(
+        "Point status: start for t0=%s; FIM polys=%d",
+        t0_utc.isoformat(),
+        len(fim_polys_5070),
+    )
     # 1) Build status GDFs
+    gpkg_addr = _ensure_input_asset(Path(settings.points.address_gpkg))
+    gpkg_lwc  = _ensure_input_asset(Path(settings.points.lwc_gpkg))
+
+    # Populate static tables once if empty
+    if settings.out.MODE in ("postgis", "both", "all") and settings.out.PG_DSN:
+        _ensure_static_points_loaded(
+            table="addresspoints_static",
+            gpkg_path=gpkg_addr,
+            layer=settings.points.address_layer,
+            dsn=settings.out.PG_DSN,
+            target_epsg=settings.points.target_epsg,
+        )
+        _ensure_static_points_loaded(
+            table="lowwatercrossings_static",
+            gpkg_path=gpkg_lwc,
+            layer=settings.points.lwc_layer,
+            dsn=settings.out.PG_DSN,
+            target_epsg=settings.points.target_epsg,
+        )
+
     addr_status = _status_from_points(settings.points.address_gpkg, layer=settings.points.address_layer, fim_polys_5070=fim_polys_5070)
     lwc_status  = _status_from_points(settings.points.lwc_gpkg,     layer=settings.points.lwc_layer, fim_polys_5070=fim_polys_5070)
 
@@ -1381,13 +1513,51 @@ def write_point_status_layers(
     if "t0" not in lwc_status.columns:   lwc_status["t0"]  = pd.Timestamp(t0_utc, tz="UTC")
     if "valid_time" not in lwc_status.columns: lwc_status["valid_time"] = pd.Timestamp(t0_utc, tz="UTC")
 
+    # Determine snapshot valid_time (expect exactly one); fallback to t0 if not present/ambiguous
+    def _single_valid_time(gdf: gpd.GeoDataFrame) -> pd.Timestamp:
+        vals = pd.to_datetime(gdf.get("valid_time"), errors="coerce", utc=True).dropna().unique()
+        if len(vals) == 1:
+            return vals[0]
+        logger.warning("Point status: expected single valid_time, found %d; using t0.", len(vals))
+        return pd.to_datetime(t0_utc, utc=True)
+
+    vt_ap = _single_valid_time(addr_status)
+    vt_lwc = _single_valid_time(lwc_status)
+
     # 4) Write to PostGIS (keeps all original columns)
     if settings.out.MODE in ("postgis","both","all"):
+        logger.info(
+            "Point status: writing to PostGIS (addresspoints=%d, lowwatercrossings=%d)",
+            len(addr_status),
+            len(lwc_status),
+        )
+        # Keep only flooded rows (status table stores positives only)
+        addr_status = addr_status[addr_status["Situation"] == "Flooded"]
+        lwc_status  = lwc_status[lwc_status["Situation"] == "Flooded"]
+
+        # Trim to minimal status columns (no geometry/attrs)
+        def _trim(g: gpd.GeoDataFrame) -> pd.DataFrame:
+            keep = [c for c in g.columns if c in {"id", "Situation", "t0", "valid_time", "OBJECTID"}]
+            return pd.DataFrame(g[keep].copy())
+
+        addr_status = _trim(addr_status)
+        lwc_status  = _trim(lwc_status)
+
         _write_points_table_postgis(
-            addr_status, table="addresspoints", schema=settings.out.PG_SCHEMA, dsn=settings.out.PG_DSN, t0_utc=t0_utc
+            addr_status,
+            table="addresspoints_status",
+            schema=settings.out.PG_SCHEMA,
+            dsn=settings.out.PG_DSN,
+            t0_utc=t0_utc,
+            vt_utc=vt_ap,
         )
         _write_points_table_postgis(
-            lwc_status, table="lowwatercrossings", schema=settings.out.PG_SCHEMA, dsn=settings.out.PG_DSN, t0_utc=t0_utc
+            lwc_status,
+            table="lowwatercrossings_status",
+            schema=settings.out.PG_SCHEMA,
+            dsn=settings.out.PG_DSN,
+            t0_utc=t0_utc,
+            vt_utc=vt_lwc,
         )
 
     # 5) Optional file/S3 exports (unchanged naming; no FIM_* column renames)
@@ -1430,14 +1600,34 @@ def _status_points_for_snapshot(
     if pts_5070.empty:
         return pts_5070.copy()
 
-    # point-in-polygon: flooded set
-    flooded = gpd.sjoin(
-        pts_5070[["OBJECTID", "geometry"]],
-        fim_slice_5070[["geometry"]],
-        how="inner",
-        predicate="within",
+    # point-in-polygon: flooded set (chunked to reduce memory/time)
+    chunk_size = int(os.getenv("POINTS_SJOIN_CHUNK", "50000"))
+    flooded_ids: set[int] = set()
+    logger.info(
+        "Point status snapshot: spatial join for snapshot t0=%s vt=%s; points=%d polys=%d chunk=%d",
+        t0_u,
+        vt_u,
+        len(pts_5070),
+        len(fim_slice_5070),
+        chunk_size,
     )
-    flooded_ids = set(flooded["OBJECTID"].tolist())
+    for start in range(0, len(pts_5070), chunk_size):
+        end = min(start + chunk_size, len(pts_5070))
+        part = pts_5070.iloc[start:end][["OBJECTID", "geometry"]]
+        joined = gpd.sjoin(
+            part,
+            fim_slice_5070[["geometry"]],
+            how="inner",
+            predicate="within",
+        )
+        flooded_ids.update(joined["OBJECTID"].tolist())
+        logger.info(
+            "Point status snapshot: chunk %d-%d -> flooded=%d (cumulative=%d)",
+            start,
+            end,
+            len(joined),
+            len(flooded_ids),
+        )
 
     g = pts_5070.copy()
     g["Situation"] = g["OBJECTID"].isin(flooded_ids).map({True: "Flooded", False: "Safe"})
@@ -1457,7 +1647,7 @@ def _status_points_for_snapshot(
 
 
 def _write_points_table_postgis(
-    gdf: gpd.GeoDataFrame,
+    gdf: pd.DataFrame | gpd.GeoDataFrame,
     *,
     table: str,
     schema: str,
@@ -1471,13 +1661,19 @@ def _write_points_table_postgis(
 
     DDL is executed in AUTOCOMMIT to avoid poisoning a transaction if a DDL step errors.
     """
+    chunk_size = int(os.getenv("POINTS_PG_CHUNKSIZE", "20000"))
     engine = create_engine(dsn)
+    is_geo = isinstance(gdf, gpd.GeoDataFrame)
 
     # 1) Minimal bootstrap: ensure schema + create table structure (no rows) if missing
     with engine.begin() as tx:
         tx.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-        # structure-only write (0 rows) so to_postgis lays out geometry/columns if table doesn't exist
-        gdf.head(0).to_postgis(name=table, con=tx, schema=schema, if_exists="append", index=False)
+        # structure-only write (0 rows) so layout exists
+        head = gdf.head(0)
+        if is_geo:
+            head.to_postgis(name=table, con=tx, schema=schema, if_exists="append", index=False)
+        else:
+            head.to_sql(name=table, con=tx, schema=schema, if_exists="append", index=False)
 
     # 2) DDL in autocommit, each statement isolated
     def _ddl(sql: str, params: dict | None = None):
@@ -1485,12 +1681,17 @@ def _write_points_table_postgis(
             cx.execute(text(sql), params or {})
 
     # Ensure expected columns exist (best effort)
-    for col_sql in (
+    col_sqls = [
         f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS id text',
         f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "t0" timestamptz',
         f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "valid_time" timestamptz',
         f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "Situation" text',
-    ):
+    ]
+    if "OBJECTID" in gdf.columns:
+        col_sqls.append(
+            f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "OBJECTID" bigint'
+        )
+    for col_sql in col_sqls:
         try:
             _ddl(col_sql)
         except Exception as _:
@@ -1507,19 +1708,21 @@ def _write_points_table_postgis(
         pass  # already there or data not yet unique; inserts will still work
 
     # Helpful indexes (also safe to re-run)
-    for sql in (
+    index_sql = [
         f'CREATE INDEX IF NOT EXISTS "{table}_t0_valid_idx" ON "{schema}"."{table}" ("t0","valid_time")',
-        f'CREATE INDEX IF NOT EXISTS "{table}_id_idx" ON "{schema}"."{table}" ("id")',
-        f'CREATE INDEX IF NOT EXISTS "{table}_t0_idx" ON "{schema}"."{table}" ("t0")',
-        f'CREATE INDEX IF NOT EXISTS "{table}_valid_time_idx" ON "{schema}"."{table}" ("valid_time")',
-        f'CREATE INDEX IF NOT EXISTS "{table}_OBJECTID_idx" ON "{schema}"."{table}" ("OBJECTID")',
-    ):
+    ]
+    if "OBJECTID" in gdf.columns:
+        index_sql.append(
+            f'CREATE INDEX IF NOT EXISTS "{table}_OBJECTID_idx" ON "{schema}"."{table}" ("OBJECTID")'
+        )
+    for sql in index_sql:
         try:
             _ddl(sql)
         except Exception:
             pass
 
     # 3) DML: delete the exact snapshot and append rows in a clean transaction
+    start = time.perf_counter()
     with engine.begin() as tx:
         tx.execute(
             text(
@@ -1528,7 +1731,34 @@ def _write_points_table_postgis(
             ),
             {"t0": t0_utc, "vt": vt_utc},
         )
-        gdf.to_postgis(name=table, con=tx, schema=schema, if_exists="append", index=False)
+        if is_geo:
+            gdf.to_postgis(
+                name=table,
+                con=tx,
+                schema=schema,
+                if_exists="append",
+                index=False,
+                chunksize=chunk_size,
+            )
+        else:
+            gdf.to_sql(
+                name=table,
+                con=tx,
+                schema=schema,
+                if_exists="append",
+                index=False,
+                chunksize=chunk_size,
+                method=None,
+            )
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "Point status: wrote %d rows to %s.%s (chunksize=%d, %.1fs)",
+        len(gdf),
+        schema,
+        table,
+        chunk_size,
+        elapsed,
+    )
 
 
 def _write_points_snapshot_outputs(
@@ -1578,8 +1808,11 @@ def write_point_status_for_snapshot(
         return
 
     # Load points once; enforce CRS 5070
-    addr_pts = _ensure_epsg_5070(gpd.read_file(settings.points.address_gpkg, layer=settings.points.address_layer))
-    lwc_pts  = _ensure_epsg_5070(gpd.read_file(settings.points.lwc_gpkg, layer=settings.points.lwc_layer))
+    addr_path = _ensure_input_asset(Path(settings.points.address_gpkg))
+    lwc_path = _ensure_input_asset(Path(settings.points.lwc_gpkg))
+
+    addr_pts = _ensure_epsg_5070(gpd.read_file(addr_path, layer=settings.points.address_layer))
+    lwc_pts  = _ensure_epsg_5070(gpd.read_file(lwc_path, layer=settings.points.lwc_layer))
     fim_slice_5070 = _ensure_epsg_5070(fim_slice_5070)
 
     # Build snapshot layers
@@ -1588,17 +1821,28 @@ def write_point_status_for_snapshot(
 
     # PostGIS
     if settings.out.MODE in ("postgis", "both", "all"):
+        # Trim status tables to lightweight columns (no geometry)
+        def _trim(g: gpd.GeoDataFrame) -> pd.DataFrame:
+            keep = [c for c in g.columns if c in {"id", "Situation", "t0", "valid_time", "OBJECTID"}]
+            out = g[keep].copy()
+            out = pd.DataFrame(out)  # ensure pandas frame (no Geo accessor)
+            return out
+
+        # Only persist flooded points to status
+        addr_status_trim = _trim(addr_status[addr_status["Situation"] == "Flooded"])
+        lwc_status_trim = _trim(lwc_status[lwc_status["Situation"] == "Flooded"])
+
         _write_points_table_postgis(
-            addr_status,
-            table="addresspoints",
+            addr_status_trim,
+            table="addresspoints_status",
             schema=settings.out.PG_SCHEMA,
             dsn=settings.out.PG_DSN,
             t0_utc=t0_u.to_pydatetime(),
             vt_utc=vt_u.to_pydatetime(),
         )
         _write_points_table_postgis(
-            lwc_status,
-            table="lowwatercrossings",
+            lwc_status_trim,
+            table="lowwatercrossings_status",
             schema=settings.out.PG_SCHEMA,
             dsn=settings.out.PG_DSN,
             t0_utc=t0_u.to_pydatetime(),

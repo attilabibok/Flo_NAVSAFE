@@ -739,10 +739,20 @@ def _mv_nowcast_sql_for_points(table_name: str) -> str:
       - Latest t0 across the base table
       - For that t0, earliest valid_time
       - DISTINCT ON (id) to guarantee row-uniqueness by id
-      - Selects * to keep all original attributes (OBJECTID, Situation, etc.)
+      - Explicitly selects columns to avoid leaking helper fields (max_t0/min_valid_time)
     """
     schema = SETTINGS.pg_schema
     base = f'"{schema}"."{table_name}"'
+    # Column order mirrors the lean status tables.
+    base_cols = [
+        'id',
+        '"Situation"',
+        '"OBJECTID"',
+        't0',
+        'valid_time',
+    ]
+    col_list = ", ".join(base_cols)
+
     return f"""
 WITH latest AS (
   SELECT MAX(t0) AS max_t0 FROM {base}
@@ -752,10 +762,12 @@ earliest AS (
   FROM {base}, latest
   WHERE t0 = latest.max_t0
 )
-SELECT DISTINCT ON (id) *
+SELECT DISTINCT ON (id)
+    {col_list}
 FROM {base}, latest, earliest
-WHERE t0 = latest.max_t0
-  AND valid_time = earliest.min_valid_time
+WHERE {base}.t0 = latest.max_t0
+  AND {base}.valid_time = earliest.min_valid_time
+  AND {base}."Situation" = 'Flooded'
 ORDER BY id;
 """
 
@@ -781,30 +793,16 @@ def main() -> None:
     ensure_featuretype(SETTINGS.flowlines_table)
     ensure_featuretype(SETTINGS.fim_table)
 
-    # 3) FIM Materialized views for nowcast and max
-    nowcast_sql = build_nowcast_sql()
-    max_sql = build_max_sql()
-
-    ensure_materialized_view("fim_nowcast", nowcast_sql, pk_column="id")
-    ensure_materialized_view("fim_max", max_sql, pk_column="id")
-
-
-    # 4) AddressPoints & LowWaterCrossings nowcast MVs
+    # 3) Publish materialized views (created/refreshed by init_postgis.py)
     ap_mv = SETTINGS.addresspoints_nowcast_view
     lwc_mv = SETTINGS.lowwater_nowcast_view
 
-    ap_sql = _mv_nowcast_sql_for_points(SETTINGS.addresspoints_table)
-    lwc_sql = _mv_nowcast_sql_for_points(SETTINGS.lowwater_table)
-
-    ensure_materialized_view(ap_mv, ap_sql, pk_column="id")
-    ensure_materialized_view(lwc_mv, lwc_sql, pk_column="id")
-
-    # 5) Publish MVs and set PK
     ensure_featuretype("fim_nowcast")
     ensure_featuretype("fim_max")
     ensure_featuretype_pk("fim_nowcast", "id")
     ensure_featuretype_pk("fim_max", "id")
 
+    # 4) AddressPoints & LowWaterCrossings nowcast MVs
     ensure_featuretype(ap_mv)
     ensure_featuretype(lwc_mv)
     ensure_featuretype_pk(ap_mv, "id")
